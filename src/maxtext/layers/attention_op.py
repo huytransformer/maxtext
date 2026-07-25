@@ -1270,6 +1270,51 @@ class AttentionOp(nnx.Module):
 
     return wrap_ragged_attention(query, key, value, lengths, block_size)
 
+  def _create_splash_attention_mask(self, mask_shape, cp_size, load_balanced_context_parallel):
+    """Creates the mask used by TPU Splash attention."""
+    mask_module = tokamax_splash_mask if self.config.use_tokamax_splash else splash_attention_mask
+    use_load_balanced_cp = cp_size > 1 and load_balanced_context_parallel
+    if self.attention_type == AttentionType.FULL:
+      mask = mask_module.FullMask(mask_shape)
+    elif self.attention_type == AttentionType.LOCAL_SLIDING:
+      if self.sliding_window_size is None:
+        raise ValueError("Sliding_window_size must be set if Local Sliding attention type")
+      # A zero right window makes LocalMask causal, matching the zero-offset mask in generate_attention_mask.
+      local_window_size = (self.sliding_window_size - 1, 0)
+      if use_load_balanced_cp:
+        mask = LoadBalancedLocalMask(
+            shape=mask_shape,
+            window_size=local_window_size,
+            offset=0,
+            cp_size=cp_size,
+        )
+      else:
+        mask = mask_module.LocalMask(
+            shape=mask_shape,
+            window_size=local_window_size,
+            offset=0,
+        )
+    elif self.attention_type == AttentionType.CHUNK:
+      if self.chunk_attn_window_size is None:
+        raise ValueError("chunk_attn_window_size must be set for chunk attention type")
+
+      if use_load_balanced_cp:
+        mask = LoadBalancedChunkedCausalMask(
+            shape=mask_shape,
+            chunk_size=self.chunk_attn_window_size,
+            cp_size=cp_size,
+        )
+      else:
+        mask = ChunkedCausalMask(
+            shape=mask_shape,
+            chunk_size=self.chunk_attn_window_size,
+        )
+    elif use_load_balanced_cp:
+      mask = LoadBalancedCausalMask(shape=mask_shape, cp_size=cp_size)
+    else:
+      mask = mask_module.CausalMask(shape=mask_shape)
+    return mask
+
   def tpu_flash_attention(
       self,
       query: Array,
@@ -1408,49 +1453,7 @@ class AttentionOp(nnx.Module):
     else:
       sa_config = create_sa_config(self.config, query, key, attn_logits_soft_cap)
       mask_shape = (query.shape[2], key.shape[2])  # (q_seq_len, kv_seq_len)
-      mask_module = tokamax_splash_mask if self.config.use_tokamax_splash else splash_attention_mask
-      if self.attention_type == AttentionType.FULL:
-        mask = mask_module.FullMask(mask_shape)
-      else:
-        mask = mask_module.CausalMask(shape=mask_shape)
-
-      use_load_balanced_cp = cp_size > 1 and load_balanced_context_parallel
-      if use_load_balanced_cp and self.attention_type != AttentionType.FULL:
-        mask = LoadBalancedCausalMask(shape=mask_shape, cp_size=cp_size)
-
-      # Apply local masking if local sliding attention is enabled.
-      if self.attention_type == AttentionType.LOCAL_SLIDING:
-        if self.sliding_window_size is None:
-          raise ValueError("Sliding_window_size must be set if Local Sliding attention type")
-        local_window_size = (self.sliding_window_size - 1, self.sliding_window_size)
-        if use_load_balanced_cp:
-          mask &= LoadBalancedLocalMask(
-              shape=(query.shape[2], key.shape[2]),
-              window_size=local_window_size,
-              offset=0,
-              cp_size=cp_size,
-          )
-        else:
-          mask &= mask_module.LocalMask(
-              shape=(query.shape[2], key.shape[2]),
-              window_size=local_window_size,
-              offset=0,
-          )
-      elif self.attention_type == AttentionType.CHUNK:
-        if self.chunk_attn_window_size is None:
-          raise ValueError("chunk_attn_window_size must be set for chunk attention type")
-
-        if use_load_balanced_cp:
-          mask &= LoadBalancedChunkedCausalMask(
-              shape=(query.shape[2], key.shape[2]),
-              chunk_size=self.chunk_attn_window_size,
-              cp_size=cp_size,
-          )
-        else:
-          mask &= ChunkedCausalMask(
-              shape=(query.shape[2], key.shape[2]),
-              chunk_size=self.chunk_attn_window_size,
-          )
+      mask = self._create_splash_attention_mask(mask_shape, cp_size, load_balanced_context_parallel)
 
     max_logit_value = None
     if not use_tokamax_ring and self.config.use_tokamax_splash:
@@ -2328,7 +2331,7 @@ class AttentionOp(nnx.Module):
 
 def _load_balanced_q_sequence(shape: tuple[int, int], cp_size: int):
   """Reorders query positions the same way as load-balanced input tokens."""
-  arr = np.arange(shape[0])
+  arr = np.arange(shape[0], dtype=np.int32)
   return max_utils.reorder_mask_load_balancing(arr, cp_size, 0)
 
 

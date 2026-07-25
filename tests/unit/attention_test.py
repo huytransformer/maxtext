@@ -28,6 +28,7 @@ from flax.linen import partitioning as nn_partitioning
 import jax
 import jax.numpy as jnp
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
+from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask_info
 from jax.sharding import AxisType, Mesh
 from maxtext.utils import max_utils
 from maxtext.utils import maxtext_utils
@@ -52,6 +53,8 @@ from maxtext.layers.attention_op import (
 from maxtext.layers.attentions import Attention
 from maxtext.layers import embeddings
 from maxtext.kernels.attention import jax_flash_attention
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask as tokamax_splash_attention_mask
+from tokamax._src.ops.experimental.tpu.splash_attention import splash_attention_mask_info as tokamax_splash_attention_mask_info
 from maxtext.configs import pyconfig
 from maxtext.models.qwen3 import Qwen3NextGatedDeltaNet
 import numpy as np
@@ -572,6 +575,181 @@ class CudnnTePackedSequenceDescriptorTest(unittest.TestCase):
           attention_type=AttentionType.CHUNK,
           chunk_attn_window_size=2,
       )
+
+
+class SplashMaskSelectionTest(unittest.TestCase):
+  """Tests the masks _create_splash_attention_mask selects for the splash processors."""
+
+  # pylint: disable=protected-access
+
+  def _make_op(self, attention_type, use_tokamax_splash=False, **kwargs):
+    config = types.SimpleNamespace(use_tokamax_splash=use_tokamax_splash)
+    mesh = types.SimpleNamespace(shape={})
+    return AttentionOp(
+        config=config,
+        num_query_heads=1,
+        num_kv_heads=1,
+        max_target_length=8,
+        mesh=mesh,
+        attention_kernel="dot_product",
+        attention_type=attention_type,
+        **kwargs,
+    )
+
+  def _assert_lazy_mask_info(self, mask, mask_info, mask_function, expected_q_sequence):
+    self.assertIsNotNone(mask_function)
+    np.testing.assert_array_equal(mask_info.q_sequence, expected_q_sequence)
+    self.assertEqual(mask_info.q_sequence.dtype, np.int32)
+    self.assertIsNone(mask_info.mask_next)
+    self.assertIsNone(mask_info.partial_mask_blocks)
+
+  def test_selects_computable_local_masks(self):
+    seq_len = 8
+    window_size = 3
+    sequence = np.arange(seq_len, dtype=np.int32)
+    mask_shape = (seq_len, seq_len)
+    q_ids = sequence[:, None]
+    kv_ids = sequence[None, :]
+    expected = (kv_ids <= q_ids) & (kv_ids > q_ids - window_size)
+
+    op = self._make_op(AttentionType.LOCAL_SLIDING, sliding_window_size=window_size)
+    mask = op._create_splash_attention_mask(mask_shape, cp_size=1, load_balanced_context_parallel=False)
+    self.assertIsInstance(mask, splash_attention_mask.LocalMask)
+    self.assertNotIsInstance(mask, attention_op.LoadBalancedLocalMask)
+    np.testing.assert_array_equal(mask[:, :], expected)
+    mask_info, mask_function = splash_attention_mask_info.process_mask(
+        splash_attention_mask.MultiHeadMask(masks=(mask,)),
+        block_shape=(2, 2),
+    )
+    self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+    mask_info, mask_function = splash_attention_mask_info.process_mask_dkv(
+        splash_attention_mask.MultiHeadMask(masks=(mask,)),
+        block_shape=(2, 2),
+    )
+    self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+
+    tokamax_op = self._make_op(AttentionType.LOCAL_SLIDING, use_tokamax_splash=True, sliding_window_size=window_size)
+    tokamax_mask = tokamax_op._create_splash_attention_mask(mask_shape, cp_size=1, load_balanced_context_parallel=False)
+    self.assertIsInstance(tokamax_mask, tokamax_splash_attention_mask.LocalMask)
+    np.testing.assert_array_equal(tokamax_mask[:, :], expected)
+    mask_info, mask_function = tokamax_splash_attention_mask_info.process_mask(tokamax_mask, block_shape=(2, 2))
+    self._assert_lazy_mask_info(tokamax_mask, mask_info, mask_function, sequence)
+    mask_info, mask_function = tokamax_splash_attention_mask_info.process_mask_dkv(tokamax_mask, block_shape=(2, 2))
+    self._assert_lazy_mask_info(tokamax_mask, mask_info, mask_function, sequence)
+
+  def test_selects_computable_chunk_mask(self):
+    seq_len = 8
+    chunk_size = 2
+    sequence = np.arange(seq_len, dtype=np.int32)
+    q_ids = sequence[:, None]
+    kv_ids = sequence[None, :]
+    expected = (kv_ids <= q_ids) & (q_ids // chunk_size == kv_ids // chunk_size)
+
+    op = self._make_op(AttentionType.CHUNK, chunk_attn_window_size=chunk_size)
+    mask = op._create_splash_attention_mask((seq_len, seq_len), cp_size=1, load_balanced_context_parallel=False)
+    self.assertIsInstance(mask, ChunkedCausalMask)
+    self.assertNotIsInstance(mask, attention_op.LoadBalancedChunkedCausalMask)
+    np.testing.assert_array_equal(mask[:, :], expected)
+
+    # The same class serves both backends, so both processors must keep it lazy.
+    mask_info, mask_function = splash_attention_mask_info.process_mask(
+        splash_attention_mask.MultiHeadMask(masks=(mask,)),
+        block_shape=(2, 2),
+    )
+    self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+    mask_info, mask_function = splash_attention_mask_info.process_mask_dkv(
+        splash_attention_mask.MultiHeadMask(masks=(mask,)),
+        block_shape=(2, 2),
+    )
+    self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+    mask_info, mask_function = tokamax_splash_attention_mask_info.process_mask(mask, block_shape=(2, 2))
+    self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+    mask_info, mask_function = tokamax_splash_attention_mask_info.process_mask_dkv(mask, block_shape=(2, 2))
+    self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+
+  def test_selects_computable_load_balanced_masks(self):
+    seq_len = 8
+    window_size = 3
+    chunk_size = 2
+    q_sequence = np.asarray([0, 1, 6, 7, 2, 3, 4, 5])
+    q_pos = q_sequence[:, None]
+    kv_ids = np.arange(seq_len)[None, :]
+    expected_local = (kv_ids <= q_pos) & (kv_ids > q_pos - window_size)
+    expected_chunk = (kv_ids <= q_pos) & (q_pos // chunk_size == kv_ids // chunk_size)
+
+    local_op = self._make_op(AttentionType.LOCAL_SLIDING, sliding_window_size=window_size)
+    local_mask = local_op._create_splash_attention_mask(
+        (seq_len, seq_len), cp_size=2, load_balanced_context_parallel=True
+    )
+    self.assertIsInstance(local_mask, attention_op.LoadBalancedLocalMask)
+
+    chunk_op = self._make_op(AttentionType.CHUNK, chunk_attn_window_size=chunk_size)
+    chunk_mask = chunk_op._create_splash_attention_mask(
+        (seq_len, seq_len), cp_size=2, load_balanced_context_parallel=True
+    )
+    self.assertIsInstance(chunk_mask, attention_op.LoadBalancedChunkedCausalMask)
+
+    for mask, expected in ((local_mask, expected_local), (chunk_mask, expected_chunk)):
+      np.testing.assert_array_equal(mask[:, :], expected)
+      for process in (splash_attention_mask_info.process_mask, splash_attention_mask_info.process_mask_dkv):
+        mask_info, mask_function = process(
+            splash_attention_mask.MultiHeadMask(masks=(mask,)),
+            block_shape=(2, 2),
+            q_seq_shards=2,
+        )
+        self._assert_lazy_mask_info(mask, mask_info, mask_function, q_sequence)
+      for process in (
+          tokamax_splash_attention_mask_info.process_mask,
+          tokamax_splash_attention_mask_info.process_mask_dkv,
+      ):
+        mask_info, mask_function = process(
+            mask,
+            block_shape=(2, 2),
+            q_seq_shards=2,
+        )
+        self._assert_lazy_mask_info(mask, mask_info, mask_function, q_sequence)
+
+  def test_selects_computable_masks_unaligned_blocks(self):
+    # Window and chunk boundaries that do not line up with the attention blocks.
+    seq_len = 16
+    window_size = 5
+    chunk_size = 3
+    sequence = np.arange(seq_len, dtype=np.int32)
+    q_ids = sequence[:, None]
+    kv_ids = sequence[None, :]
+    cases = (
+        (
+            AttentionType.LOCAL_SLIDING,
+            {"sliding_window_size": window_size},
+            (kv_ids <= q_ids) & (kv_ids > q_ids - window_size),
+        ),
+        (
+            AttentionType.CHUNK,
+            {"chunk_attn_window_size": chunk_size},
+            (kv_ids <= q_ids) & (q_ids // chunk_size == kv_ids // chunk_size),
+        ),
+    )
+    for attention_type, mask_kwargs, expected in cases:
+      op = self._make_op(attention_type, **mask_kwargs)
+      mask = op._create_splash_attention_mask((seq_len, seq_len), cp_size=1, load_balanced_context_parallel=False)
+      np.testing.assert_array_equal(mask[:, :], expected)
+      for process in (splash_attention_mask_info.process_mask, splash_attention_mask_info.process_mask_dkv):
+        mask_info, mask_function = process(
+            splash_attention_mask.MultiHeadMask(masks=(mask,)),
+            block_shape=(4, 4),
+        )
+        self._assert_lazy_mask_info(mask, mask_info, mask_function, sequence)
+      tokamax_op = self._make_op(attention_type, use_tokamax_splash=True, **mask_kwargs)
+      tokamax_mask = tokamax_op._create_splash_attention_mask(
+          (seq_len, seq_len), cp_size=1, load_balanced_context_parallel=False
+      )
+      np.testing.assert_array_equal(tokamax_mask[:, :], expected)
+      for process in (
+          tokamax_splash_attention_mask_info.process_mask,
+          tokamax_splash_attention_mask_info.process_mask_dkv,
+      ):
+        mask_info, mask_function = process(tokamax_mask, block_shape=(4, 4))
+        self._assert_lazy_mask_info(tokamax_mask, mask_info, mask_function, sequence)
 
 
 class AttentionTest(parameterized.TestCase):
